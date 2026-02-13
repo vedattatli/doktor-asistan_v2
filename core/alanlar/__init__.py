@@ -1,0 +1,2 @@
+"""Alan bazli yardimci moduller."""
+
