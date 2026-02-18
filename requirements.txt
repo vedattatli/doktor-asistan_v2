@@ -1,4 +1,11 @@
-pandas>=2.0
-pydantic>=2.0
-plotly>=5.0
-
+streamlit
+chromadb
+ollama
+pdfplumber
+pandas
+plotly
+pydantic
+scipy
+numpy
+openpyxl
+pytest
