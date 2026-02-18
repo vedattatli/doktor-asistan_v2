@@ -1,12 +1,17 @@
 import os
 import json
-from uuid import uuid4
+import hashlib
 
 from core.analiz_motoru import KlinikAnalizMotoru
 from core.alanlar.lab.df_uret import parsed_pages_to_df
 
 
 PARSED_DIR = "data/parsed"
+
+
+def generate_page_id(file_name: str, page_no: int, rendered_text: str) -> str:
+    unique_str = f"{file_name}|p{page_no}|{rendered_text}"
+    return hashlib.sha256(unique_str.encode("utf-8")).hexdigest()
 
 
 def _save_parsed_pages_json(file_name: str, parsed_pages: list[dict]) -> str:
@@ -45,9 +50,10 @@ def ingest_pdf(pdf_path, collection, motor=None):
 
         patient = page_data.get("patient", {})
         page_no = page_data.get("page")
+        unique_id = generate_page_id(file_name, page_no, rendered_text)
 
         documents.append(rendered_text)
-        ids.append(f"{file_name}_p{page_no}_{uuid4()}")
+        ids.append(unique_id)
         metadatas.append(
             {
                 "source": page_data.get("source", file_name),
@@ -60,6 +66,6 @@ def ingest_pdf(pdf_path, collection, motor=None):
         )
 
     if documents:
-        collection.add(documents=documents, metadatas=metadatas, ids=ids)
+        collection.upsert(documents=documents, metadatas=metadatas, ids=ids)
 
     return len(documents)

@@ -77,6 +77,24 @@ def df_schema_ozeti_uret(df):
         f"ornek_testler={testler[:20]}"
     )
 
+
+def rapor_izinli_testleri_uret(parsed_pages):
+    df = parsed_pages_to_df(parsed_pages)
+    if df.empty or "test" not in df.columns:
+        return []
+    return sorted([t for t in df["test"].dropna().astype(str).unique().tolist() if t])
+
+
+def spec_kullanilan_testleri(spec):
+    testler = set()
+    data = spec.data
+    for tek in [data.test, data.x_test, data.y_test]:
+        if tek:
+            testler.add(str(tek))
+    testler.update([str(t) for t in (data.tests or []) if t])
+    testler.update([str(t) for t in (data.series or []) if t])
+    return sorted(testler)
+
 # --- 3. KULLANICI ARAYÜZÜ (STREAMLIT) ---
 
 # Veritabanı bağlantısını oturum bazlı başlatıyoruz
@@ -101,6 +119,28 @@ with st.sidebar:
 
                 # Motoru çalıştırıp veritabanına sayfa chunk olarak kaydediyoruz
                 adet = sisteme_kaydet(yol, st.session_state.koleksiyon, motor)
+                kayitlar = st.session_state.koleksiyon.get(
+                    where={"source": dosya.name},
+                    include=["metadatas"],
+                )
+                metalar = kayitlar.get("metadatas") or []
+                aktif_hasta = next(
+                    (
+                        m.get("patient_name")
+                        for m in metalar
+                        if isinstance(m, dict) and (m.get("patient_name") or "").strip()
+                    ),
+                    None,
+                )
+                if aktif_hasta and aktif_hasta != "Bilinmiyor":
+                    st.session_state["active_patient_name"] = aktif_hasta
+                json_adi = f"{dosya.name}.json"
+                try:
+                    parsed_rapor = load_parsed_json(json_adi)
+                    st.session_state["allowed_tests_for_active_report"] = rapor_izinli_testleri_uret(parsed_rapor)
+                    st.session_state["selected_parsed_report"] = json_adi
+                except Exception:
+                    st.session_state["allowed_tests_for_active_report"] = []
                 st.toast(f"{dosya.name}: {adet} sayfa işlendi ve doğrulandı.")
             st.success("Tüm raporlar klinik hafızaya alındı. Sorgulamaya başlayabilirsiniz.")
 
@@ -126,9 +166,15 @@ with st.sidebar:
             options=json_files,
             index=json_files.index(secili),
         )
+        try:
+            parsed_rapor = load_parsed_json(st.session_state["selected_parsed_report"])
+            st.session_state["allowed_tests_for_active_report"] = rapor_izinli_testleri_uret(parsed_rapor)
+        except Exception:
+            st.session_state["allowed_tests_for_active_report"] = []
         st.caption("Grafik sorularında seçilen rapor kullanılacak.")
     else:
-        st.session_state.selected_parsed_report = None
+        st.session_state["selected_parsed_report"] = None
+        st.session_state["allowed_tests_for_active_report"] = []
         st.info("Henüz parse edilmiş rapor yok. Önce PDF yükleyip analiz et.")
         
 # Ana Ekran Başlığı
@@ -165,11 +211,22 @@ if sorgu := st.chat_input("Örn: Enes Aktürk'ün HGB durumu nedir?"):
                 available_tests = sorted(
                     [t for t in df["test"].dropna().astype(str).unique().tolist() if t]
                 )
+                allowed_tests = st.session_state.get("allowed_tests_for_active_report") or []
+                planner_tests = allowed_tests if allowed_tests else available_tests
                 spec = plan_chart_spec(
                     user_text=sorgu,
                     df_schema_summary=df_schema_ozeti_uret(df),
-                    available_tests=available_tests,
+                    available_tests=planner_tests,
                 )
+                if allowed_tests:
+                    kullanilan_testler = spec_kullanilan_testleri(spec)
+                    izinli_kume = set(allowed_tests)
+                    gecersiz = [t for t in kullanilan_testler if t not in izinli_kume]
+                    if gecersiz:
+                        izinli_yazi = ", ".join(allowed_tests)
+                        raise GrafikPlanlamaHatasi(
+                            f"Bu raporda yalnızca şu testler kullanılabilir: {izinli_yazi}"
+                        )
                 fig = render(spec, df)
                 st.plotly_chart(fig, use_container_width=True)
 
@@ -183,8 +240,10 @@ if sorgu := st.chat_input("Örn: Enes Aktürk'ün HGB durumu nedir?"):
                 st.session_state.messages.append({"role": "assistant", "content": hata})
     else:
         # 1) Retrieval: sayfa bilgili doğrulanmış parçaları getir
+        aktif_hasta = st.session_state.get("active_patient_name")
+        meta_filtre = {"patient_name": aktif_hasta} if aktif_hasta else None
         context_docs, context_metas = query_db(
-            st.session_state.koleksiyon, sorgu, n_results=6
+            st.session_state.koleksiyon, sorgu, n_results=6, filter_meta=meta_filtre
         )
 
         # 2) Generation: sadece context'ten konuş
