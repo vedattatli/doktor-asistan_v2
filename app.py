@@ -9,6 +9,7 @@ except ImportError:
 import streamlit as st
 import chromadb
 import os
+import shutil
 from core.analiz_motoru import KlinikAnalizMotoru
 from core.ingestion import ingest_pdf
 from core.retrieval import query_db
@@ -26,6 +27,7 @@ PDF_DIR = "./data/pdfs"
 COLLECTION_NAME = "klinik_v3"
 os.makedirs(DB_PATH, exist_ok=True)
 os.makedirs(PDF_DIR, exist_ok=True)
+SAFE_DELETE_ROOTS = [os.path.abspath("./data"), os.path.abspath("./uploads")]
 
 # Analiz motorunu (beyni) başlatıyoruz
 motor = KlinikAnalizMotoru()
@@ -94,6 +96,88 @@ def spec_kullanilan_testleri(spec):
     testler.update([str(t) for t in (data.tests or []) if t])
     testler.update([str(t) for t in (data.series or []) if t])
     return sorted(testler)
+
+
+def grafik_menu_mesaji(available_tests, rapor_secili=True):
+    if not rapor_secili:
+        return "Grafik için önce bir rapor seç."
+    if not available_tests:
+        return "Bu raporda çizilebilir test bulamadım."
+
+    secenekler = ", ".join(available_tests[:6])
+    if len(available_tests) > 6:
+        secenekler = f"{secenekler} …"
+    varsayilan = ", ".join(available_tests[:2])
+    return (
+        f"Seçenekler: {secenekler}\n"
+        "Hangisini çizeyim?\n"
+        f"Varsayılan: {varsayilan} trendi"
+    )
+
+
+def grafik_sorusu_belirsiz_mi(soru: str, available_tests: list[str]) -> bool:
+    metin = (soru or "").lower()
+    if any(anahtar in metin for anahtar in ("trend", "korelasyon", "scatter", "heatmap", "ısı", "isi")):
+        return False
+    if any(str(test).lower() in metin for test in available_tests):
+        return False
+    return any(anahtar in metin for anahtar in ("grafik", "chart", "plot", "çiz", "ciz"))
+
+
+def _guvenli_yol_mu(path: str) -> bool:
+    abs_path = os.path.abspath(path)
+    for kok in SAFE_DELETE_ROOTS:
+        if abs_path == kok or abs_path.startswith(kok + os.sep):
+            return True
+    return False
+
+
+def _guvenli_sil(path: str) -> bool:
+    if not path:
+        return False
+    abs_path = os.path.abspath(path)
+    if not _guvenli_yol_mu(abs_path):
+        return False
+    try:
+        if os.path.isfile(abs_path):
+            os.remove(abs_path)
+            return True
+        if os.path.isdir(abs_path):
+            shutil.rmtree(abs_path)
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def secili_hastayi_sil(secili_json: str, collection):
+    if not secili_json:
+        return False, "Silinecek bir rapor seçili değil."
+    if secili_json != os.path.basename(secili_json):
+        return False, "Geçersiz dosya seçimi."
+
+    pdf_adi = secili_json[:-5] if secili_json.endswith(".json") else secili_json
+    parsed_yol = os.path.join("data", "parsed", secili_json)
+    pdf_yol = os.path.join(PDF_DIR, pdf_adi)
+    index_klasor = os.path.join(DB_PATH, pdf_adi)
+
+    silindi = any(
+        [
+            _guvenli_sil(parsed_yol),
+            _guvenli_sil(pdf_yol),
+            _guvenli_sil(index_klasor),
+        ]
+    )
+
+    try:
+        collection.delete(where={"source": pdf_adi})
+        silindi = True
+    except Exception:
+        pass
+
+    if not silindi:
+        return False, "Seçili hasta için silinecek veri bulunamadı."
+    return True, "Seçili hasta verileri silindi."
 
 # --- 3. KULLANICI ARAYÜZÜ (STREAMLIT) ---
 
@@ -172,6 +256,19 @@ with st.sidebar:
         except Exception:
             st.session_state["allowed_tests_for_active_report"] = []
         st.caption("Grafik sorularında seçilen rapor kullanılacak.")
+        if st.button("🧯 Hastayı Sil (PDF+JSON+Index)"):
+            basarili, mesaj = secili_hastayi_sil(
+                st.session_state.get("selected_parsed_report"),
+                st.session_state.koleksiyon,
+            )
+            if basarili:
+                st.session_state["selected_parsed_report"] = None
+                st.session_state["allowed_tests_for_active_report"] = []
+                st.session_state["active_patient_name"] = None
+                st.success(mesaj)
+                st.rerun()
+            else:
+                st.warning(mesaj)
     else:
         st.session_state["selected_parsed_report"] = None
         st.session_state["allowed_tests_for_active_report"] = []
@@ -198,11 +295,14 @@ if sorgu := st.chat_input("Örn: Enes Aktürk'ün HGB durumu nedir?"):
 
     if grafik_istegi_mi(sorgu):
         with st.chat_message("assistant"):
+            available_tests = []
+            secili_rapor = st.session_state.get("selected_parsed_report")
+            if not secili_rapor:
+                menu = grafik_menu_mesaji([], rapor_secili=False)
+                st.info(menu)
+                st.session_state.messages.append({"role": "assistant", "content": menu})
+                st.stop()
             try:
-                secili_rapor = st.session_state.get("selected_parsed_report")
-                if not secili_rapor:
-                    raise GrafikPlanlamaHatasi("Grafik modu için rapor seçilmedi.")
-
                 parsed_pages = load_parsed_json(secili_rapor)
                 df = parsed_pages_to_df(parsed_pages)
                 if df.empty:
@@ -211,31 +311,45 @@ if sorgu := st.chat_input("Örn: Enes Aktürk'ün HGB durumu nedir?"):
                 available_tests = sorted(
                     [t for t in df["test"].dropna().astype(str).unique().tolist() if t]
                 )
-                allowed_tests = st.session_state.get("allowed_tests_for_active_report") or []
-                planner_tests = allowed_tests if allowed_tests else available_tests
-                spec = plan_chart_spec(
-                    user_text=sorgu,
-                    df_schema_summary=df_schema_ozeti_uret(df),
-                    available_tests=planner_tests,
-                )
-                if allowed_tests:
-                    kullanilan_testler = spec_kullanilan_testleri(spec)
-                    izinli_kume = set(allowed_tests)
-                    gecersiz = [t for t in kullanilan_testler if t not in izinli_kume]
-                    if gecersiz:
-                        izinli_yazi = ", ".join(allowed_tests)
-                        raise GrafikPlanlamaHatasi(
-                            f"Bu raporda yalnızca şu testler kullanılabilir: {izinli_yazi}"
-                        )
-                fig = render(spec, df)
-                st.plotly_chart(fig, use_container_width=True)
+                if grafik_sorusu_belirsiz_mi(sorgu, available_tests):
+                    menu = grafik_menu_mesaji(available_tests, rapor_secili=True)
+                    st.info(menu)
+                    st.session_state.messages.append({"role": "assistant", "content": menu})
+                    st.stop()
+                else:
+                    allowed_tests = st.session_state.get("allowed_tests_for_active_report") or []
+                    planner_tests = allowed_tests if allowed_tests else available_tests
+                    spec = plan_chart_spec(
+                        user_text=sorgu,
+                        df_schema_summary=df_schema_ozeti_uret(df),
+                        available_tests=planner_tests,
+                    )
+                    if allowed_tests:
+                        kullanilan_testler = spec_kullanilan_testleri(spec)
+                        izinli_kume = set(allowed_tests)
+                        gecersiz = [t for t in kullanilan_testler if t not in izinli_kume]
+                        if gecersiz:
+                            izinli_yazi = ", ".join(allowed_tests)
+                            raise GrafikPlanlamaHatasi(
+                                f"Bu raporda yalnızca şu testler kullanılabilir: {izinli_yazi}"
+                            )
+                    fig = render(spec, df)
+                    st.plotly_chart(fig, use_container_width=True)
 
-                bilgi = f"Grafik üretildi: {spec.template.value}"
-                st.caption(bilgi)
-                st.session_state.messages.append({"role": "assistant", "content": bilgi})
+                    bilgi = f"Grafik üretildi: {spec.template.value}"
+                    st.caption(bilgi)
+                    st.session_state.messages.append({"role": "assistant", "content": bilgi})
 
-            except Exception as e:
-                hata = f"Bu grafiği çizemem: {e}"
+            except GrafikPlanlamaHatasi:
+                menu = grafik_menu_mesaji(available_tests, rapor_secili=bool(secili_rapor))
+                st.info(menu)
+                st.session_state.messages.append({"role": "assistant", "content": menu})
+            except GrafikRenderHatasi:
+                hata = "Grafik oluşturulamadı. Lütfen test adını daha net yaz."
+                st.error(hata)
+                st.session_state.messages.append({"role": "assistant", "content": hata})
+            except Exception:
+                hata = "Grafik isteği işlenemedi. Lütfen tekrar dene."
                 st.error(hata)
                 st.session_state.messages.append({"role": "assistant", "content": hata})
     else:
@@ -265,5 +379,7 @@ if sorgu := st.chat_input("Örn: Enes Aktürk'ün HGB durumu nedir?"):
                 cevap_kutusu.markdown(tam_cevap)
                 st.session_state.messages.append({"role": "assistant", "content": tam_cevap})
 
-            except Exception as e:
-                st.error(f"Yanıt üretilirken bir hata oluştu: {e}")
+            except Exception:
+                hata = "Yanıt üretilirken geçici bir sorun oluştu. Lütfen tekrar dene."
+                st.error(hata)
+                st.session_state.messages.append({"role": "assistant", "content": hata})
