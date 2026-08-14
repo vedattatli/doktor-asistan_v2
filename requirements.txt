@@ -1,4 +1,7 @@
+streamlit
+chromadb
+ollama
+pdfplumber
 pandas>=2.0
 pydantic>=2.0
 plotly>=5.0
-
